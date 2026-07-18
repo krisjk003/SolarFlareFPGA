@@ -1,0 +1,67 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+.history/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ==========================
+# Dataset (ignore contents)
+# ==========================
+data/raw/*
+data/interim/*
+data/processed/*
+data/cleaned/*
+data/removed/*
+data/quarantine/*
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!data/cleaned/.gitkeep
+!data/removed/.gitkeep
+!data/quarantine/.gitkeep
+
+# Keep split CSVs
+!data/splits/
+!data/splits/*.csv
+
+# ==========================
+# Outputs (ignore contents)
+# ==========================
+checkpoints/*
+logs/*
+reports/*
+results/*
+predictions/*
+
+# Keep folders
+!checkpoints/.gitkeep
+!logs/.gitkeep
+!reports/.gitkeep
+!results/.gitkeep
+!predictions/.gitkeep
+
+# ==========================
+# Model files
+# ==========================
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db

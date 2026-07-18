@@ -1,0 +1,38 @@
+dataset:
+  root: "data/raw/SDOBenchmark_full"
+  image_extensions: [".jpg"]
+  image_size: [224, 224]
+
+  # Use ImageNet normalization for pretrained ResNet18
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+  frame_mode: "last"
+  label_source: "csv"
+  flare_class_binning: "binary"
+  val_fraction: 0.25
+  split_seed: 42
+  train_split_name: "training"
+
+model:
+  name: "resnet18"
+  pretrained: true
+  dropout: 0.2
+  freeze_backbone: false
+
+training:
+  device: "cuda"
+  batch_size: 8          # Use 8 if your GPU has enough memory
+  num_epochs: 30         # 2 is only for testing
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  num_workers: 4         # 0 works, but 4 is usually faster
+  early_stopping_patience: 10
+
+paths:
+  interim_dir: "data/interim"
+  splits_dir: "data/splits"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  report_dir: "reports"
+  quarantine_dir: "data/quarantine"
