@@ -24,6 +24,15 @@ package was not present among the uploaded folders -- add it before running
 this script; the import guard below explains exactly what is expected if
 it's still missing.
 
+Imbalance handling (FLARE is a small minority of sequences): this script
+supports two independent, config-gated mitigations, both on by default --
+class-weighted CrossEntropyLoss (`training.class_weighting`) and a
+WeightedRandomSampler on the train loader only (`training.weighted_sampler`)
+-- plus TSS/FLARE-F1-based best-checkpoint selection (`training.checkpoint_metric`,
+default "tss", falling back to FLARE F1 when TSS isn't computable and
+finally to validation loss if neither FLARE metric applies at all). See the
+Trainer class and the two config-gated sections in main() below for details.
+
 Usage:
     python scripts/train.py --config configs/config.yaml
     python scripts/train.py --config configs/config.yaml --resume checkpoints/last_model.pth
@@ -37,6 +46,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -45,7 +55,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from torch import nn  # noqa: E402
-from torch.utils.data import DataLoader  # noqa: E402
+from torch.utils.data import DataLoader, WeightedRandomSampler  # noqa: E402
+from torchvision import transforms  # noqa: E402
+from sklearn.utils.class_weight import compute_class_weight  # noqa: E402
 
 from datasets.scanner import DatasetScanner  # noqa: E402
 from datasets.sdo_dataset import SDOBenchmarkDataset  # noqa: E402
@@ -54,6 +66,7 @@ from utils.config import load_config  # noqa: E402
 from utils.device import resolve_device  # noqa: E402
 from utils.image_utils import SUPPORTED_EXTENSIONS  # noqa: E402
 from utils.logger import setup_logger  # noqa: E402
+from utils.metrics import compute_classification_metrics  # noqa: E402
 from utils.visualization import plot_training_curves  # noqa: E402
 
 
@@ -85,6 +98,7 @@ _ID_LIKE_COLUMNS = {
 def _load_split_dataset(
     split_csv: Path, scanner: DatasetScanner, image_size: Tuple[int, int],
     mean: List[float], std: List[float], frame_mode: str, logger,
+    transform: Optional[Any] = None,
 ) -> SDOBenchmarkDataset:
     if not split_csv.exists():
         raise FileNotFoundError(
@@ -100,7 +114,24 @@ def _load_split_dataset(
             continue
         records.append(record)
         label_map[record.sequence_id] = int(row.label_index)
-    return SDOBenchmarkDataset(records, label_map, image_size, mean, std, frame_mode)
+    return SDOBenchmarkDataset(records, label_map, image_size, mean, std, frame_mode, transform=transform)
+
+
+def _best_epoch_index(history: Dict[str, List[float]]) -> Tuple[int, str, float]:
+    """Mirrors Trainer's checkpoint-selection priority (tss -> flare_f1 ->
+    neg_val_loss) so the end-of-run summary reports the epoch that was
+    actually saved as best_model.pth, not just the lowest val_loss epoch.
+    """
+    for key, negate, name in (
+        ("val_tss", False, "tss"),
+        ("val_flare_f1", False, "flare_f1"),
+        ("val_loss", True, "neg_val_loss"),
+    ):
+        candidates = [(-v if negate else v, i) for i, v in enumerate(history.get(key, [])) if v is not None]
+        if candidates:
+            best_value, best_idx = max(candidates)
+            return best_idx, name, (-best_value if negate else best_value)
+    return 0, "n/a", float("nan")
 
 
 class Trainer:
@@ -117,6 +148,7 @@ class Trainer:
         device: torch.device,
         checkpoint_dir: Path,
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        checkpoint_metric: str = "tss",
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -124,6 +156,8 @@ class Trainer:
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.scaler = scaler
+        # Which metric decides "is_best" -- see _select_checkpoint_metric.
+        self.checkpoint_metric = checkpoint_metric
 
     def train_one_epoch(self, loader: DataLoader) -> Tuple[float, float]:
         self.model.train()
@@ -151,17 +185,79 @@ class Trainer:
         return total_loss / max(total, 1), correct / max(total, 1)
 
     @torch.no_grad()
-    def validate(self, loader: DataLoader) -> Tuple[float, float]:
+    def validate(self, loader: DataLoader, class_names: List[str]) -> Dict[str, Optional[float]]:
+        """Runs one validation pass. Returns a dict with `loss` and
+        `accuracy` (always present), plus `flare_precision`, `flare_recall`,
+        `flare_f1`, and `tss` -- computed via the same
+        `utils.metrics.compute_classification_metrics` evaluate.py uses, so
+        training-time and evaluation-time numbers agree. Those four keys
+        are `None` (not zero) when `class_names` doesn't describe the
+        project's binary FLARE/QUIET scheme, so callers can tell "not
+        applicable" from "zero score".
+        """
         self.model.eval()
         total_loss, correct, total = 0.0, 0, 0
+        all_true: List[np.ndarray] = []
+        all_pred: List[np.ndarray] = []
         for images, labels in loader:
             images, labels = images.to(self.device), labels.to(self.device)
             outputs = self.model(images)
             loss = self.criterion(outputs, labels)
+            preds = outputs.argmax(dim=1)
+
             total_loss += loss.item() * images.size(0)
-            correct += (outputs.argmax(dim=1) == labels).sum().item()
+            correct += (preds == labels).sum().item()
             total += images.size(0)
-        return total_loss / max(total, 1), correct / max(total, 1)
+            all_true.append(labels.cpu().numpy())
+            all_pred.append(preds.cpu().numpy())
+
+        metrics: Dict[str, Optional[float]] = {
+            "loss": total_loss / max(total, 1),
+            "accuracy": correct / max(total, 1),
+            "flare_precision": None,
+            "flare_recall": None,
+            "flare_f1": None,
+            "tss": None,
+        }
+        if all_true:
+            y_true = np.concatenate(all_true)
+            y_pred = np.concatenate(all_pred)
+            extra = compute_classification_metrics(y_true, y_pred, y_prob=None, class_names=class_names)
+            for key in ("flare_precision", "flare_recall", "flare_f1", "tss"):
+                if key in extra:
+                    metrics[key] = extra[key]
+        return metrics
+
+    def _select_checkpoint_metric(self, val_metrics: Dict[str, Optional[float]]) -> Tuple[float, str]:
+        """Resolve which validation metric drives `is_best` this epoch, per
+        the project's checkpoint-selection policy: TSS by default (or
+        FLARE F1 if `self.checkpoint_metric == "flare_f1"`), falling back to
+        FLARE F1 when TSS isn't available, and finally to negated validation
+        loss if neither FLARE metric applies at all (e.g. not a binary
+        FLARE/QUIET run) -- so a "best" checkpoint still gets saved instead
+        of never updating. Returns (value_where_higher_is_better, name).
+        """
+        if self.checkpoint_metric == "flare_f1" and val_metrics.get("flare_f1") is not None:
+            return val_metrics["flare_f1"], "flare_f1"
+        if val_metrics.get("tss") is not None:
+            return val_metrics["tss"], "tss"
+        if val_metrics.get("flare_f1") is not None:
+            return val_metrics["flare_f1"], "flare_f1"
+        return -val_metrics["loss"], "neg_val_loss"
+
+    @staticmethod
+    def _history_best(history: Dict[str, List[float]]) -> float:
+        """Recovers the running-best checkpoint-selection value from
+        `history` (used when resuming via --resume), applying the same
+        tss -> flare_f1 -> neg_val_loss priority as
+        `_select_checkpoint_metric`, so resumed training doesn't reset (or
+        wrongly inflate) the "best so far" baseline.
+        """
+        for key, negate in (("val_tss", False), ("val_flare_f1", False), ("val_loss", True)):
+            values = [v for v in history.get(key, []) if v is not None]
+            if values:
+                return max(-v for v in values) if negate else max(values)
+        return float("-inf")
 
     def fit(
         self,
@@ -176,33 +272,49 @@ class Trainer:
         logger=None,
     ) -> Dict[str, List[float]]:
         history = history or {"train_loss": [], "val_loss": [], "train_accuracy": [], "val_accuracy": []}
-        best_val_loss = min(history["val_loss"]) if history["val_loss"] else float("inf")
+        # Additive keys: present even when resuming from a checkpoint saved
+        # before this update (old history dicts won't have them yet).
+        history.setdefault("val_tss", [])
+        history.setdefault("val_flare_f1", [])
+
+        best_metric_value = self._history_best(history)
+        best_val_loss = min(history["val_loss"]) if history["val_loss"] else float("inf")  # kept for reference/state compatibility
         epochs_without_improvement = 0
 
         for epoch in range(start_epoch, num_epochs + 1):
             t0 = time.time()
             train_loss, train_acc = self.train_one_epoch(train_loader)
-            val_loss, val_acc = self.validate(val_loader)
+            val_metrics = self.validate(val_loader, class_names)
+            val_loss, val_acc = val_metrics["loss"], val_metrics["accuracy"]
             elapsed = time.time() - t0
 
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
             history["train_accuracy"].append(train_acc)
             history["val_accuracy"].append(val_acc)
+            history["val_tss"].append(val_metrics["tss"])
+            history["val_flare_f1"].append(val_metrics["flare_f1"])
 
-            is_best = val_loss < best_val_loss
+            metric_value, metric_name = self._select_checkpoint_metric(val_metrics)
+            is_best = metric_value > best_metric_value
             if is_best:
-                best_val_loss = val_loss
+                best_metric_value = metric_value
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
+            best_val_loss = min(best_val_loss, val_loss)  # reference only; no longer drives is_best
 
             if logger:
                 logger.info(
-                    "Epoch %d/%d (%.1fs) - train_loss=%.4f train_acc=%.4f - val_loss=%.4f val_acc=%.4f%s",
+                    "Epoch %d/%d (%.1fs) - train_loss=%.4f train_acc=%.4f - val_loss=%.4f val_acc=%.4f "
+                    "val_tss=%s val_flare_f1=%s%s",
                     epoch, num_epochs, elapsed, train_loss, train_acc, val_loss, val_acc,
+                    f"{val_metrics['tss']:.4f}" if val_metrics["tss"] is not None else "n/a",
+                    f"{val_metrics['flare_f1']:.4f}" if val_metrics["flare_f1"] is not None else "n/a",
                     " (best)" if is_best else "",
                 )
+                if is_best:
+                    logger.info("New best checkpoint (epoch %d): %s=%.4f", epoch, metric_name, metric_value)
 
             state = {
                 "epoch": epoch,
@@ -213,13 +325,18 @@ class Trainer:
                 "class_names": class_names,
                 "config": config,
                 "best_val_loss": best_val_loss,
+                # Additive, backward-compatible: which metric/value counts as
+                # "best" under the new policy. Existing keys above are
+                # unchanged, so evaluate.py's checkpoint loading keeps working.
+                "checkpoint_metric": metric_name,
+                "best_checkpoint_metric_value": best_metric_value,
             }
             save_checkpoint(state, is_best, self.checkpoint_dir)
 
             if epochs_without_improvement >= early_stopping_patience:
                 if logger:
                     logger.info(
-                        "Early stopping: no val_loss improvement for %d epochs.", early_stopping_patience
+                        "Early stopping: no %s improvement for %d epochs.", metric_name, early_stopping_patience
                     )
                 break
 
@@ -278,9 +395,32 @@ def main() -> None:
     std = dataset_cfg.get("std", [0.229, 0.224, 0.225])
     frame_mode = dataset_cfg.get("frame_mode", "last")
 
+    # Training-time augmentations, applied only to the training split. Every
+    # transform below operates on the deterministic (H, W, 3) PIL image that
+    # `SDOBenchmarkDataset` builds from `preprocess_image()` -- i.e. after
+    # loading, 3-channel conversion, and resizing, but before normalisation.
+    # Kept mild/conservative since SDOBenchmark patches don't have a strong
+    # canonical "up" orientation but are also not natural photographs.
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),        
+        transforms.RandomRotation(degrees=5),        
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    # Validation must reflect real inference-time input, so no augmentation --
+    # only the same deterministic ToTensor()/Normalize() training also ends with.
+    val_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
     try:
-        train_dataset = _load_split_dataset(splits_dir / "train.csv", scanner, image_size, mean, std, frame_mode, logger)
-        val_dataset = _load_split_dataset(splits_dir / "val.csv", scanner, image_size, mean, std, frame_mode, logger)
+        train_dataset = _load_split_dataset(
+            splits_dir / "train.csv", scanner, image_size, mean, std, frame_mode, logger, transform=train_transform
+        )
+        val_dataset = _load_split_dataset(
+            splits_dir / "val.csv", scanner, image_size, mean, std, frame_mode, logger, transform=val_transform
+        )
     except (FileNotFoundError, ValueError) as exc:
         logger.error(str(exc))
         sys.exit(1)
@@ -288,7 +428,43 @@ def main() -> None:
 
     batch_size = int(training_cfg.get("batch_size", 32))
     num_workers = int(training_cfg.get("num_workers", 4))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+    # ------------------------------------------------------------------
+    # Shared prep for class weighting (below) and weighted sampling (next
+    # section): per-class sample counts from the TRAIN split only.
+    # ------------------------------------------------------------------
+    train_labels = np.array([label for _, label in train_dataset.samples])
+    class_counts = np.bincount(train_labels, minlength=num_classes)
+    logger.info("Training samples per class: %s", class_counts.tolist())
+
+    # ------------------------------------------------------------------
+    # WeightedRandomSampler (training.weighted_sampler, default: true).
+    # ------------------------------------------------------------------
+    # Complements class-weighted loss below by oversampling FLARE sequences
+    # so each epoch actually shows the model more minority-class examples,
+    # rather than relying solely on the loss function to compensate. Only
+    # ever applied to the TRAIN loader -- val_loader (and evaluate.py's test
+    # loader, untouched) must keep reflecting the real class distribution.
+    use_weighted_sampler = bool(training_cfg.get("weighted_sampler", True))
+    train_sampler = None
+    if use_weighted_sampler:
+        inv_class_freq = 1.0 / np.clip(class_counts, a_min=1, a_max=None)
+        sample_weights = inv_class_freq[train_labels]
+        train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        logger.info("WeightedRandomSampler enabled for the train loader (val/test loaders are unaffected).")
+    else:
+        logger.info("WeightedRandomSampler disabled (training.weighted_sampler=false); using plain shuffling.")
+
+    # shuffle and sampler are mutually exclusive in DataLoader -- shuffle is
+    # only True when there's no sampler.
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, num_workers=num_workers,
+        sampler=train_sampler, shuffle=(train_sampler is None),
+    )
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     model = build_model(model_cfg, num_classes).to(device)
@@ -297,7 +473,27 @@ def main() -> None:
         lr=float(training_cfg.get("learning_rate", 3e-4)),
         weight_decay=float(training_cfg.get("weight_decay", 1e-4)),
     )
-    class_weights = torch.tensor([17.75, 1.0], dtype=torch.float32).to(device)
+
+    # ------------------------------------------------------------------
+    # Class-weighted loss (training.class_weighting, default: true).
+    # ------------------------------------------------------------------
+    # Solar-flare data is heavily imbalanced (FLARE is a small minority of
+    # sequences), so an unweighted CrossEntropyLoss lets the model minimize
+    # loss by mostly predicting the majority class. Inverse-frequency class
+    # weights (sklearn's `compute_class_weight(class_weight="balanced", ...)`,
+    # equivalent to n_samples / (n_classes * class_count)) penalize
+    # minority-class mistakes more heavily to counteract that.
+    use_class_weighting = bool(training_cfg.get("class_weighting", True))
+    if use_class_weighting:
+        class_weights_np = compute_class_weight(
+            class_weight="balanced", classes=np.arange(num_classes), y=train_labels
+        )
+        logger.info("Inverse-frequency class weights: %s", class_weights_np.tolist())
+        class_weights = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
+    else:
+        logger.info("Class weighting disabled (training.class_weighting=false); using plain CrossEntropyLoss.")
+        class_weights = None
+
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     use_amp = bool(training_cfg.get("mixed_precision", False)) and device.type == "cuda"
@@ -306,7 +502,10 @@ def main() -> None:
         logger.info("Mixed-precision training enabled.")
 
     checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints"))
-    trainer = Trainer(model, optimizer, criterion, device, checkpoint_dir, scaler)
+    # training.checkpoint_metric (default: "tss") -- see Trainer._select_checkpoint_metric
+    # for the full tss -> flare_f1 -> neg_val_loss fallback policy.
+    checkpoint_metric_cfg = str(training_cfg.get("checkpoint_metric", "tss")).strip().lower()
+    trainer = Trainer(model, optimizer, criterion, device, checkpoint_dir, scaler, checkpoint_metric=checkpoint_metric_cfg)
 
     start_epoch, history = 1, None
     if args.resume:
@@ -329,11 +528,12 @@ def main() -> None:
         json.dump(history, f, indent=2)
     plot_training_curves(history, report_dir)
 
-    best_epoch = int(min(range(len(history["val_loss"])), key=lambda i: history["val_loss"][i])) + 1
+    best_idx, best_metric_name, best_metric_value = _best_epoch_index(history)
     logger.info(
-        "Training complete. Best epoch: %d (val_loss=%.4f, val_acc=%.4f). "
+        "Training complete. Best epoch: %d (%s=%.4f, val_loss=%.4f, val_acc=%.4f). "
         "Checkpoints in %s, curves in %s.",
-        best_epoch, history["val_loss"][best_epoch - 1], history["val_accuracy"][best_epoch - 1],
+        best_idx + 1, best_metric_name, best_metric_value,
+        history["val_loss"][best_idx], history["val_accuracy"][best_idx],
         checkpoint_dir, report_dir,
     )
 

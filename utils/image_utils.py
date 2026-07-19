@@ -2,8 +2,17 @@
 utils/image_utils.py
 
 Image I/O helpers shared across the dataset scanner, the PyTorch Dataset,
-and predict.py. Centralised here so loading/resizing/normalisation logic is
-implemented exactly once (avoids duplicate code across modules).
+and predict.py. Centralised here so loading/resizing logic is implemented
+exactly once (avoids duplicate code across modules).
+
+`preprocess_image()` is deliberately deterministic: it only loads, converts
+to 3-channel, and resizes. It never normalises and never augments. Training-
+time augmentation and ToTensor()/Normalize() are applied downstream via
+torchvision `transform` pipelines (see `datasets.sdo_dataset` and
+`train.py`), so the same on-disk file always decodes to the same array here,
+regardless of whether it ends up in a training or validation/inference
+batch. `normalize_image()` is kept as a standalone numpy-based utility for
+callers that want mean/std normalisation without pulling in torchvision.
 
 Supports JPG/JPEG/PNG via Pillow and FITS via astropy. FITS support is
 optional at import time: if astropy is missing, only an informative error is
@@ -149,15 +158,18 @@ def normalize_image(image: np.ndarray, mean: Sequence[float], std: Sequence[floa
     return (image - mean_arr) / std_arr
 
 
-def preprocess_image(
-    path: PathLike, size: Tuple[int, int], mean: Sequence[float], std: Sequence[float]
-) -> np.ndarray:
-    """Full preprocessing pipeline for a single image file: load -> RGB ->
-    resize -> normalise. Returns an (H, W, 3) float32 array ready to be
-    converted to a CHW torch tensor by the caller.
+def preprocess_image(path: PathLike, size: Tuple[int, int]) -> np.ndarray:
+    """Deterministic preprocessing pipeline for a single image file: load ->
+    RGB -> resize. Returns an (H, W, 3) float32 array in the [0, 255] range.
+
+    Intentionally does NOT normalise (and never applies random augmentation)
+    so this function's output is identical every time it's called on the
+    same file -- callers that need augmentation and/or normalisation apply
+    their own torchvision `transform` pipeline afterwards (see
+    `datasets.sdo_dataset.SDOBenchmarkDataset`, `train.py`'s
+    `train_transform`/`val_transform`, and `predict.py`).
     """
     array = load_image_as_array(path)
     array = to_three_channel(array)
     array = resize_image(array, size)
-    array = normalize_image(array, mean, std)
     return array

@@ -32,6 +32,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from PIL import Image  # noqa: E402
+from torchvision import transforms  # noqa: E402
 
 from datasets.scanner import DatasetScanner  # noqa: E402
 from utils.checkpoint import load_checkpoint  # noqa: E402
@@ -134,12 +136,21 @@ def main() -> None:
     frame_paths = [record.image_paths[-1]] if frame_mode == "last" else list(record.image_paths)
     logger.info("Predicting on %d frame(s) (frame_mode=%s) from %s.", len(frame_paths), frame_mode, input_path)
 
+    # preprocess_image() only loads/resizes/3-channels now (deterministic,
+    # no normalisation) -- inference must apply the same ToTensor()/
+    # Normalize() the model was trained with (train.py's val_transform).
+    inference_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
     per_frame: List[Dict[str, Any]] = []
     prob_stack = []
     with torch.no_grad():
         for frame_path in frame_paths:
-            array = preprocess_image(frame_path, image_size, mean, std)
-            tensor = torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1))).float().unsqueeze(0).to(device)
+            array = preprocess_image(frame_path, image_size)
+            image = Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
+            tensor = inference_transform(image).unsqueeze(0).to(device)
             logits = model(tensor)
             probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
             prob_stack.append(probs)

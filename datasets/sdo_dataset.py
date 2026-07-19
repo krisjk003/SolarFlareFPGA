@@ -2,18 +2,30 @@
 datasets/sdo_dataset.py
 
 PyTorch Dataset wrapping the scanned SDOBenchmark sequences. Each element is
-a single, fully preprocessed image tensor (resized, 3-channel, normalised)
-paired with an integer class label.
+a single, deterministically preprocessed image (resized, 3-channel) paired
+with an integer class label. Loading/resizing is delegated entirely to
+`utils.image_utils.preprocess_image`, which never normalises or augments --
+that happens here, in `__getitem__`, via an injectable torchvision
+`transform` (e.g. `train.py`'s `train_transform` with augmentations, or
+`val_transform` without).
+
+If no `transform` is supplied, the dataset falls back to a plain
+ToTensor() + Normalize(mean, std) pipeline built from the `mean`/`std`
+arguments, so existing callers that construct this dataset without an
+explicit transform (e.g. evaluate.py) keep getting correctly normalised,
+unaugmented tensors exactly as before this refactor.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
+from torchvision import transforms
 
 from datasets.scanner import SequenceRecord
 from utils.image_utils import preprocess_image
@@ -44,14 +56,23 @@ class SDOBenchmarkDataset(Dataset):
         mean: Sequence[float],
         std: Sequence[float],
         frame_mode: str = "last",
+        transform: Optional[Callable] = None,
     ) -> None:
         """
         Args:
             records: Sequences discovered by DatasetScanner.
             label_map: sequence_id -> integer class index, from LabelResolver.
             image_size: (width, height) target size for every image.
-            mean, std: Per-channel normalisation statistics.
+            mean, std: Per-channel normalisation statistics. Used to build
+                the fallback transform below when `transform` is omitted.
             frame_mode: "last" or "all" (see class docstring).
+            transform: Optional torchvision-style callable applied to each
+                (PIL) image in `__getitem__`, expected to end in ToTensor()
+                (and typically Normalize()) so it returns a CHW float tensor.
+                Pass augmentations here for training (see `train.py`'s
+                `train_transform`) or a plain ToTensor()+Normalize() for
+                validation/inference (`val_transform`). If omitted, a
+                ToTensor()+Normalize(mean, std) pipeline is used by default.
 
         Raises:
             ValueError: If the resulting dataset would be empty.
@@ -59,6 +80,13 @@ class SDOBenchmarkDataset(Dataset):
         self.image_size = tuple(image_size)
         self.mean = tuple(mean)
         self.std = tuple(std)
+        self.transform = transform
+        # Backward-compatible default: callers that don't pass an explicit
+        # `transform` (e.g. evaluate.py) still get correctly normalised,
+        # unaugmented tensors, matching this dataset's pre-refactor behaviour.
+        self._default_transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize(mean=self.mean, std=self.std)]
+        )
         self.samples: List[Tuple[str, int]] = self._build_index(records, label_map, frame_mode)
         if not self.samples:
             raise ValueError(
@@ -92,16 +120,20 @@ class SDOBenchmarkDataset(Dataset):
 
         Images that fail to decode here (despite passing the lightweight
         scan-time check) are treated as corrupted: logged and replaced with
-        a neutral zero tensor rather than crashing the whole training run.
+        a neutral zero tensor -- built directly, bypassing `transform` --
+        rather than crashing the whole training run.
         """
         path_str, label = self.samples[idx]
         try:
-            array = preprocess_image(path_str, self.image_size, self.mean, self.std)
+            array = preprocess_image(path_str, self.image_size)
         except Exception as exc:
             logger.warning("Failed to load image at __getitem__ (%s): %s. Using a blank tensor instead.",
                             path_str, exc)
             array = np.zeros((self.image_size[1], self.image_size[0], 3), dtype=np.float32)
+            # HWC -> CHW for PyTorch.
+            return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1))).float(), label
 
-        # HWC -> CHW for PyTorch.
-        tensor = torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1))).float()
+        image = Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
+        transform = self.transform if self.transform is not None else self._default_transform
+        tensor = transform(image)
         return tensor, label
